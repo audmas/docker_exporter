@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -12,10 +14,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-const dockerAPI = "http://localhost:2375"
-const exporterPort = ":9102" // Changed default port to 9102
+const (
+	dockerSocket = "/var/run/docker.sock"
+	exporterPort = ":9102"
+)
 
-// ContainerStats holds the stats we fetch from the Docker API
+// ContainerStats stores container stats
 type ContainerStats struct {
 	ID         string
 	Name       string
@@ -23,10 +27,10 @@ type ContainerStats struct {
 	MemUsage   float64
 	MemLimit   float64
 	MemPercent float64
-	Uptime     float64 // Uptime in seconds
+	Uptime     float64
 }
 
-// Metrics for Prometheus
+// Prometheus metrics
 var (
 	cpuUsage = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -69,9 +73,31 @@ var (
 	)
 )
 
-// Fetch running containers
+// getDockerClient returns an HTTP client that connects via Unix socket
+func getDockerClient() (*http.Client, error) {
+	dialer := &net.Dialer{}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", dockerSocket)
+		},
+	}
+	client := &http.Client{Transport: transport}
+	return client, nil
+}
+
+// getContainers fetches running containers
 func getContainers() ([]map[string]interface{}, error) {
-	resp, err := http.Get(dockerAPI + "/containers/json")
+	client, err := getDockerClient()
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("GET", "http://localhost/containers/json", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -91,9 +117,19 @@ func getContainers() ([]map[string]interface{}, error) {
 	return containers, nil
 }
 
-// Fetch container stats
+// getContainerStats fetches stats for a container
 func getContainerStats(containerID string) (*ContainerStats, error) {
-	resp, err := http.Get(dockerAPI + "/containers/" + containerID + "/stats?stream=false")
+	client, err := getDockerClient()
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("GET", "http://localhost/containers/"+containerID+"/stats?stream=false", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +162,12 @@ func getContainerStats(containerID string) (*ContainerStats, error) {
 	memPercent := (memUsage / memLimit) * 100.0
 
 	// Fetch container start time
-	resp, err = http.Get(dockerAPI + "/containers/" + containerID + "/json")
+	req, err = http.NewRequest("GET", "http://localhost/containers/"+containerID+"/json", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err = client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +194,7 @@ func getContainerStats(containerID string) (*ContainerStats, error) {
 
 	// Get container name
 	name := containerInfo["Name"].(string)
-	name = strings.TrimPrefix(name, "/") // Remove leading '/'
+	name = strings.TrimPrefix(name, "/")
 
 	return &ContainerStats{
 		ID:         containerID,
@@ -166,7 +207,7 @@ func getContainerStats(containerID string) (*ContainerStats, error) {
 	}, nil
 }
 
-// Collect and update metrics
+// updateMetrics collects and updates container metrics
 func updateMetrics() {
 	for {
 		containers, err := getContainers()
@@ -196,13 +237,8 @@ func updateMetrics() {
 }
 
 func main() {
-	// Register Prometheus metrics
 	prometheus.MustRegister(cpuUsage, memUsage, memLimit, memPercent, uptime)
-
-	// Start updating metrics in the background
 	go updateMetrics()
-
-	// Start HTTP server for Prometheus scraping
 	http.Handle("/metrics", promhttp.Handler())
 	fmt.Println("Docker Stats Exporter running on http://localhost" + exporterPort + "/metrics")
 	http.ListenAndServe(exporterPort, nil)
