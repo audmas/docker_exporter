@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -15,11 +18,20 @@ import (
 )
 
 const (
-	dockerSocket = "/var/run/docker.sock"
-	exporterPort = ":9102"
+	dockerSocket    = "/var/run/docker.sock"
+	exporterVersion = "0.0.2"
 )
 
-// ContainerStats stores container stats
+var dockerClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return net.Dial("unix", dockerSocket)
+		},
+		DisableKeepAlives: true,
+	},
+	Timeout: 10 * time.Second,
+}
+
 type ContainerStats struct {
 	ID         string
 	Name       string
@@ -30,171 +42,129 @@ type ContainerStats struct {
 	Uptime     float64
 }
 
-// Prometheus metrics
 var (
 	cpuUsage = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "docker_container_cpu_usage_percent",
-			Help: "CPU usage of the container as a percentage",
-		},
+		prometheus.GaugeOpts{Name: "docker_container_cpu_usage_percent", Help: "CPU usage of the container"},
 		[]string{"container_id", "container_name"},
 	)
-
 	memUsage = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "docker_container_memory_usage_bytes",
-			Help: "Memory usage of the container in bytes",
-		},
+		prometheus.GaugeOpts{Name: "docker_container_memory_usage_bytes", Help: "Memory usage"},
 		[]string{"container_id", "container_name"},
 	)
-
 	memLimit = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "docker_container_memory_limit_bytes",
-			Help: "Memory limit of the container in bytes",
-		},
+		prometheus.GaugeOpts{Name: "docker_container_memory_limit_bytes", Help: "Memory limit"},
 		[]string{"container_id", "container_name"},
 	)
-
 	memPercent = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "docker_container_memory_usage_percent",
-			Help: "Memory usage percentage of the container",
-		},
+		prometheus.GaugeOpts{Name: "docker_container_memory_usage_percent", Help: "Memory usage percent"},
 		[]string{"container_id", "container_name"},
 	)
-
 	uptime = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "docker_container_uptime_seconds",
-			Help: "Uptime of the container in seconds",
-		},
+		prometheus.GaugeOpts{Name: "docker_container_uptime_seconds", Help: "Container uptime"},
 		[]string{"container_id", "container_name"},
 	)
 )
 
-// getDockerClient returns an HTTP client that connects via Unix socket
-func getDockerClient() (*http.Client, error) {
-	dialer := &net.Dialer{}
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "unix", dockerSocket)
-		},
+func getPort() string {
+	versionFlag := flag.Bool("version", false, "Print the exporter version and exit")
+	portFlag := flag.String("port", "", "Port to run the exporter on")
+	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("Docker Exporter version %s\n", exporterVersion)
+		os.Exit(0)
 	}
-	client := &http.Client{Transport: transport}
-	return client, nil
+
+	if *portFlag != "" {
+		return ":" + *portFlag
+	}
+
+	if envPort := os.Getenv("EXPORTER_PORT"); envPort != "" {
+		return ":" + envPort
+	}
+
+	return ":9102"
 }
 
-// getContainers fetches running containers
-func getContainers() ([]map[string]interface{}, error) {
-	client, err := getDockerClient()
-	if err != nil {
-		return nil, err
-	}
 
+func getContainers() ([]map[string]interface{}, error) {
 	req, err := http.NewRequest("GET", "http://localhost/containers/json", nil)
 	if err != nil {
 		return nil, err
 	}
-
-	resp, err := client.Do(req)
+	resp, err := dockerClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var containers []map[string]interface{}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-
 	err = json.Unmarshal(body, &containers)
-	if err != nil {
-		return nil, err
-	}
-
-	return containers, nil
+	return containers, err
 }
 
-// getContainerStats fetches stats for a container
 func getContainerStats(containerID string) (*ContainerStats, error) {
-	client, err := getDockerClient()
+	statsReq, err := http.NewRequest("GET", fmt.Sprintf("http://localhost/containers/%s/stats?stream=false", containerID), nil)
 	if err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest("GET", "http://localhost/containers/"+containerID+"/stats?stream=false", nil)
+	statsResp, err := dockerClient.Do(statsReq)
 	if err != nil {
 		return nil, err
 	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	defer statsResp.Body.Close()
 
 	var stats map[string]interface{}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(statsResp.Body)
 	if err != nil {
 		return nil, err
 	}
-
-	err = json.Unmarshal(body, &stats)
-	if err != nil {
+	if err := json.Unmarshal(body, &stats); err != nil {
 		return nil, err
 	}
 
-	// Extract CPU usage
-	cpuDelta := stats["cpu_stats"].(map[string]interface{})["cpu_usage"].(map[string]interface{})["total_usage"].(float64) -
-		stats["precpu_stats"].(map[string]interface{})["cpu_usage"].(map[string]interface{})["total_usage"].(float64)
-	systemDelta := stats["cpu_stats"].(map[string]interface{})["system_cpu_usage"].(float64) -
-		stats["precpu_stats"].(map[string]interface{})["system_cpu_usage"].(float64)
+	cpuDelta := getFloat(stats, "cpu_stats.cpu_usage.total_usage") - getFloat(stats, "precpu_stats.cpu_usage.total_usage")
+	systemDelta := getFloat(stats, "cpu_stats.system_cpu_usage") - getFloat(stats, "precpu_stats.system_cpu_usage")
 	cpuPercent := 0.0
-	if systemDelta > 0.0 {
+	if systemDelta > 0 {
 		cpuPercent = (cpuDelta / systemDelta) * 100.0
 	}
 
-	// Extract memory usage
-	memUsage := stats["memory_stats"].(map[string]interface{})["usage"].(float64)
-	memLimit := stats["memory_stats"].(map[string]interface{})["limit"].(float64)
+	memUsage := getFloat(stats, "memory_stats.usage")
+	memLimit := getFloat(stats, "memory_stats.limit")
 	memPercent := (memUsage / memLimit) * 100.0
 
-	// Fetch container start time
-	req, err = http.NewRequest("GET", "http://localhost/containers/"+containerID+"/json", nil)
+	infoReq, err := http.NewRequest("GET", fmt.Sprintf("http://localhost/containers/%s/json", containerID), nil)
 	if err != nil {
 		return nil, err
 	}
-
-	resp, err = client.Do(req)
+	infoResp, err := dockerClient.Do(infoReq)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer infoResp.Body.Close()
 
-	var containerInfo map[string]interface{}
-	body, err = ioutil.ReadAll(resp.Body)
+	var info map[string]interface{}
+	body, err = io.ReadAll(infoResp.Body)
 	if err != nil {
 		return nil, err
 	}
-
-	err = json.Unmarshal(body, &containerInfo)
-	if err != nil {
+	if err := json.Unmarshal(body, &info); err != nil {
 		return nil, err
 	}
 
-	startTimeStr := containerInfo["State"].(map[string]interface{})["StartedAt"].(string)
+	startTimeStr := info["State"].(map[string]interface{})["StartedAt"].(string)
 	startTime, err := time.Parse(time.RFC3339Nano, startTimeStr)
 	if err != nil {
 		return nil, err
 	}
+	uptime := time.Since(startTime).Seconds()
 
-	uptimeSeconds := time.Since(startTime).Seconds()
-
-	// Get container name
-	name := containerInfo["Name"].(string)
-	name = strings.TrimPrefix(name, "/")
+	name := strings.TrimPrefix(info["Name"].(string), "/")
 
 	return &ContainerStats{
 		ID:         containerID,
@@ -203,43 +173,79 @@ func getContainerStats(containerID string) (*ContainerStats, error) {
 		MemUsage:   memUsage,
 		MemLimit:   memLimit,
 		MemPercent: memPercent,
-		Uptime:     uptimeSeconds,
+		Uptime:     uptime,
 	}, nil
 }
 
-// updateMetrics collects and updates container metrics
-func updateMetrics() {
+func updateMetrics(ctx context.Context) {
 	for {
-		containers, err := getContainers()
-		if err != nil {
-			fmt.Println("Error fetching containers:", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		for _, container := range containers {
-			containerID := container["Id"].(string)
-			stats, err := getContainerStats(containerID)
+		select {
+		case <-ctx.Done():
+			log.Println("Stopping metrics update...")
+			return
+		default:
+			containers, err := getContainers()
 			if err != nil {
-				fmt.Println("Error fetching stats for container", containerID, ":", err)
+				log.Println("Error fetching containers:", err)
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
-			cpuUsage.WithLabelValues(stats.ID, stats.Name).Set(stats.CPUPercent)
-			memUsage.WithLabelValues(stats.ID, stats.Name).Set(stats.MemUsage)
-			memLimit.WithLabelValues(stats.ID, stats.Name).Set(stats.MemLimit)
-			memPercent.WithLabelValues(stats.ID, stats.Name).Set(stats.MemPercent)
-			uptime.WithLabelValues(stats.ID, stats.Name).Set(stats.Uptime)
-		}
+			for _, container := range containers {
+				containerID := container["Id"].(string)
+				stats, err := getContainerStats(containerID)
+				if err != nil {
+					log.Printf("Error fetching stats for container %s: %v\n", containerID, err)
+					continue
+				}
 
-		time.Sleep(5 * time.Second)
+				cpuUsage.WithLabelValues(stats.ID, stats.Name).Set(stats.CPUPercent)
+				memUsage.WithLabelValues(stats.ID, stats.Name).Set(stats.MemUsage)
+				memLimit.WithLabelValues(stats.ID, stats.Name).Set(stats.MemLimit)
+				memPercent.WithLabelValues(stats.ID, stats.Name).Set(stats.MemPercent)
+				uptime.WithLabelValues(stats.ID, stats.Name).Set(stats.Uptime)
+			}
+
+			time.Sleep(5 * time.Second)
+		}
 	}
 }
 
-func main() {
-	prometheus.MustRegister(cpuUsage, memUsage, memLimit, memPercent, uptime)
-	go updateMetrics()
-	http.Handle("/metrics", promhttp.Handler())
-	fmt.Println("Docker Stats Exporter running on http://localhost" + exporterPort + "/metrics")
-	http.ListenAndServe(exporterPort, nil)
+func getFloat(data map[string]interface{}, path string) float64 {
+	parts := strings.Split(path, ".")
+	var val interface{} = data
+	for _, part := range parts {
+		m, ok := val.(map[string]interface{})
+		if !ok {
+			return 0.0
+		}
+		val = m[part]
+	}
+	if f, ok := val.(float64); ok {
+		return f
+	}
+	return 0.0
 }
+
+func main() {
+	exporterPort := getPort()
+	log.Printf("Starting Docker Exporter version %s on port %s...\n", exporterVersion, exporterPort)
+
+	prometheus.MustRegister(cpuUsage, memUsage, memLimit, memPercent, uptime)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go updateMetrics(ctx)
+
+	http.Handle("/metrics", promhttp.Handler())
+	http.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(exporterVersion))
+	})
+
+	log.Printf("Exporter running on http://localhost%s/metrics\n", exporterPort)
+	if err := http.ListenAndServe(exporterPort, nil); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
+}
+
