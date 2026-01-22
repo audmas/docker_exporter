@@ -210,6 +210,13 @@ func getContainerStats(containerID string) (*ContainerStats, error) {
 // updateMetrics collects and updates container metrics
 func updateMetrics() {
 	for {
+		// Reset all metrics to remove stale containers
+		cpuUsage.Reset()
+		memUsage.Reset()
+		memLimit.Reset()
+		memPercent.Reset()
+		uptime.Reset()
+
 		containers, err := getContainers()
 		if err != nil {
 			fmt.Println("Error fetching containers:", err)
